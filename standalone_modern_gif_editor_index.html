@@ -1,0 +1,801 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Modern GIF Editor & Creator (Standalone)</title>
+  
+  <!--
+    Modern, standalone GIF editor written in vanilla HTML/CSS/JS.
+    Features:
+      1) Drag & drop uploads (images / GIFs / videos)
+      2) Basic editing: crop, resize, rotate
+      3) Text overlays: font, size, color, draggable
+      4) Create GIFs from videos (trim + frame rate)
+      5) Import & export GIFs (with simple optimization controls)
+      6) Live preview before export
+      7) Share via Web Share API (if supported), otherwise download
+
+    Notes on implementation & compatibility:
+      - Uses <canvas> for editing and rendering.
+      - Uses gif.js (web worker) for GIF encoding — broadly supported in modern browsers.
+      - Video → GIF uses frame extraction by seeking the <video> element.
+      - This is a single file; external worker is loaded via CDN (declared below).
+      - All major browsers supported; Safari may show limits with very large videos.
+  -->
+
+  <style>
+    :root {
+      --bg: #0f172a;         /* slate-900 */
+      --panel: #111827;      /* gray-900 */
+      --muted: #1f2937;      /* gray-800 */
+      --text: #e5e7eb;       /* gray-200 */
+      --text-dim: #9ca3af;   /* gray-400 */
+      --accent: #22d3ee;     /* cyan-400 */
+      --accent-2: #a78bfa;   /* violet-400 */
+      --danger: #ef4444;     /* red-500 */
+      --ok: #22c55e;         /* green-500 */
+      --shadow: 0 10px 30px rgba(0,0,0,.35);
+      --radius: 16px;
+    }
+
+    * { box-sizing: border-box; }
+    html, body { height: 100%; }
+    body {
+      margin: 0;
+      font-family: ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Ubuntu, Cantarell, "Helvetica Neue", Arial;
+      background: linear-gradient(120deg, #0b1220, #0f172a 30%, #0b1020 100%);
+      color: var(--text);
+      overflow: hidden;
+    }
+
+    header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 14px 18px;
+      background: rgba(17,24,39,.7);
+      backdrop-filter: blur(8px);
+      border-bottom: 1px solid #111827;
+      position: sticky;
+      top: 0;
+      z-index: 20;
+    }
+    header h1 {
+      font-size: 18px;
+      margin: 0;
+      letter-spacing: .3px;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }
+    header h1 .dot { width: 10px; height: 10px; border-radius: 999px; background: var(--accent); box-shadow: 0 0 16px var(--accent); }
+
+    .layout {
+      display: grid;
+      grid-template-columns: 320px 1fr 340px; /* left tools, canvas, right panel */
+      grid-template-rows: 1fr 220px;         /* bottom timeline */
+      grid-template-areas: 
+        "left main right"
+        "left timeline right";
+      height: calc(100% - 64px);
+      gap: 14px;
+      padding: 14px;
+    }
+
+    .panel {
+      background: linear-gradient(180deg, rgba(31,41,55,.5), rgba(31,41,55,.2));
+      border: 1px solid rgba(255,255,255,.06);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+    }
+
+    /* Left tools */
+    #leftPanel { grid-area: left; display: flex; flex-direction: column; overflow: hidden; }
+    #rightPanel { grid-area: right; display: flex; flex-direction: column; overflow: hidden; }
+
+    .section { padding: 14px; border-bottom: 1px solid rgba(255,255,255,.06); }
+    .section:last-child { border-bottom: none; }
+
+    .section h3 { margin: 0 0 10px; font-size: 13px; color: var(--text-dim); text-transform: uppercase; letter-spacing: .12em; }
+
+    .dropzone {
+      border: 1.5px dashed rgba(255,255,255,.18);
+      border-radius: 14px;
+      padding: 22px;
+      text-align: center;
+      background: rgba(2,6,23,.5);
+      cursor: pointer;
+      transition: .2s ease;
+    }
+    .dropzone:hover { border-color: var(--accent); box-shadow: inset 0 0 0 1px rgba(34,211,238,.25); }
+    .dropzone.dragover { border-color: var(--accent-2); background: rgba(39, 17, 66, .35); }
+    .dropzone small { color: var(--text-dim); }
+
+    .controls {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 8px;
+    }
+
+    label { font-size: 12px; color: var(--text-dim); }
+    input[type="number"], input[type="text"], select {
+      width: 100%;
+      background: #0b1020;
+      color: var(--text);
+      border: 1px solid rgba(255,255,255,.08);
+      border-radius: 10px;
+      padding: 8px 10px;
+      outline: none;
+    }
+    input[type="range"] { width: 100%; }
+
+    .btn {
+      background: linear-gradient(180deg, rgba(34,211,238,.25), rgba(167,139,250,.25));
+      border: 1px solid rgba(255,255,255,.08);
+      color: var(--text);
+      padding: 10px 12px;
+      border-radius: 12px;
+      cursor: pointer;
+      font-weight: 600;
+      letter-spacing: .2px;
+      transition: transform .05s ease, filter .2s ease;
+      user-select: none;
+    }
+    .btn:hover { filter: brightness(1.1); }
+    .btn:active { transform: scale(.98); }
+    .btn.secondary { background: rgba(255,255,255,.06); }
+    .btn.danger { background: rgba(239, 68, 68, .2); border-color: rgba(239, 68, 68, .5); }
+    .btn.block { width: 100%; text-align: center; }
+    .btn-row { display: flex; gap: 8px; flex-wrap: wrap; }
+
+    /* Main canvas area */
+    #main { grid-area: main; display: grid; place-items: center; position: relative; overflow: hidden; }
+    .canvas-wrap {
+      position: relative; width: 100%; height: 100%;
+      display: grid; place-items: center; overflow: auto;
+      background: repeating-conic-gradient(#1f2937 0 25%, #111827 0 50%) 50% / 20px 20px;
+      border-radius: var(--radius);
+      border: 1px solid rgba(255,255,255,.06);
+      box-shadow: var(--shadow);
+    }
+    canvas { background: transparent; max-width: 95%; max-height: 95%; border-radius: 8px; }
+
+    /* Crop overlay */
+    .crop-rect { position: absolute; border: 2px dashed var(--accent); background: rgba(34,211,238,.15); pointer-events: none; }
+
+    /* Timeline */
+    #timeline { grid-area: timeline; display: flex; gap: 14px; }
+
+    .timeline-left, .timeline-right { flex: 1; }
+    .timeline-panel { height: 100%; padding: 14px; overflow: auto; }
+
+    .thumbs { display: grid; grid-template-columns: repeat(auto-fill, 80px); gap: 8px; }
+    .thumb { border: 1px solid rgba(255,255,255,.08); border-radius: 10px; overflow: hidden; background: #0b1020; position: relative; }
+    .thumb img { display: block; width: 100%; height: 64px; object-fit: cover; }
+    .thumb small { position: absolute; bottom: 4px; right: 6px; font-size: 10px; color: var(--text-dim); background: rgba(0,0,0,.45); padding: 2px 4px; border-radius: 6px; }
+
+    /* Right: Preview & Export */
+    #preview { width: 100%; border-radius: 12px; border: 1px solid rgba(255,255,255,.08); background: #0b1020; min-height: 220px; display: grid; place-items: center; overflow: hidden; }
+
+    .hint { font-size: 12px; color: var(--text-dim); }
+    .kbd { border: 1px solid rgba(255,255,255,.12); background: rgba(255,255,255,.06); border-radius: 6px; padding: 1px 6px; font-size: 11px; }
+
+    .footer-bar { display: flex; gap: 10px; align-items: center; justify-content: space-between; margin-top: 10px; }
+
+    @media (max-width: 1200px) {
+      .layout {
+        grid-template-columns: 1fr; grid-template-rows: auto auto auto auto; height: auto; overflow: auto; padding-bottom: 120px;
+        grid-template-areas:
+          "left"
+          "main"
+          "right"
+          "timeline";
+      }
+      #timeline { min-height: 240px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="panel">
+    <h1><span class="dot"></span> Modern GIF Editor</h1>
+    <div class="btn-row">
+      <button id="newProject" class="btn secondary" title="Reset everything (Alt+N)">New</button>
+      <button id="openFiles" class="btn">Open Files</button>
+      <input id="hiddenFile" type="file" accept="image/*,video/*,.gif" multiple style="display:none" />
+      <button id="saveProject" class="btn" title="Export current canvas as PNG (Alt+S)">Export PNG</button>
+    </div>
+  </header>
+
+  <div class="layout">
+    <!-- Left panel: Import & Tools -->
+    <aside id="leftPanel" class="panel">
+      <div class="section">
+        <h3>Import</h3>
+        <div id="dropzone" class="dropzone">
+          <strong>Drag & Drop</strong> files here<br />
+          <small>Images (PNG/JPG/GIF) or Videos (MP4/WebM)</small>
+        </div>
+        <div class="btn-row" style="margin-top:10px">
+          <button id="browseBtn" class="btn block">Browse…</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Canvas</h3>
+        <div class="controls" style="margin-bottom:8px">
+          <div>
+            <label for="canvasW">Width</label>
+            <input id="canvasW" type="number" min="1" step="1" value="512">
+          </div>
+          <div>
+            <label for="canvasH">Height</label>
+            <input id="canvasH" type="number" min="1" step="1" value="512">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="resizeCanvas" class="btn">Resize</button>
+          <button id="fitToImage" class="btn secondary">Fit to Media</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Edit</h3>
+        <div class="btn-row">
+          <button id="startCrop" class="btn">Crop</button>
+          <button id="applyCrop" class="btn ok" disabled>Apply Crop</button>
+          <button id="cancelCrop" class="btn secondary" disabled>Cancel</button>
+        </div>
+        <div style="height:8px"></div>
+        <div class="controls">
+          <div>
+            <label for="rotate">Rotate (°)</label>
+            <input id="rotate" type="number" value="0" step="1">
+          </div>
+          <div>
+            <label>&nbsp;</label>
+            <button id="applyRotate" class="btn block">Apply</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Text Overlay</h3>
+        <div class="controls" style="margin-bottom:8px">
+          <div>
+            <label for="textInput">Text</label>
+            <input id="textInput" type="text" placeholder="Enter text…">
+          </div>
+          <div>
+            <label for="fontSize">Size</label>
+            <input id="fontSize" type="number" value="32" min="6" max="200">
+          </div>
+        </div>
+        <div class="controls" style="margin-bottom:8px">
+          <div>
+            <label for="fontFamily">Font</label>
+            <select id="fontFamily">
+              <option>Inter</option>
+              <option>Arial</option>
+              <option>Impact</option>
+              <option>Georgia</option>
+              <option>Courier New</option>
+              <option>Times New Roman</option>
+            </select>
+          </div>
+          <div>
+            <label for="fontColor">Color</label>
+            <input id="fontColor" type="color" value="#ffffff">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="addText" class="btn">Add Text</button>
+          <button id="clearText" class="btn secondary">Clear Text</button>
+        </div>
+        <p class="hint" style="margin-top:8px">Tip: Drag text directly on the canvas. Hold <span class="kbd">Shift</span> to lock axis.</p>
+      </div>
+
+      <div class="section">
+        <h3>Video → GIF</h3>
+        <div class="controls" style="margin-bottom:8px">
+          <div>
+            <label for="trimStart">Trim start (s)</label>
+            <input id="trimStart" type="number" value="0" min="0" step=".1">
+          </div>
+          <div>
+            <label for="trimEnd">Trim end (s)</label>
+            <input id="trimEnd" type="number" value="5" min="0" step=".1">
+          </div>
+        </div>
+        <div class="controls" style="margin-bottom:8px">
+          <div>
+            <label for="fps">Frame rate</label>
+            <input id="fps" type="number" value="12" min="1" max="30">
+          </div>
+          <div>
+            <label for="scale">Scale (%)</label>
+            <input id="scale" type="number" value="100" min="10" max="200">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="videoToGif" class="btn">Create GIF from Video</button>
+        </div>
+      </div>
+    </aside>
+
+    <!-- Main editing surface -->
+    <main id="main">
+      <div class="canvas-wrap">
+        <canvas id="canvas" width="512" height="512"></canvas>
+        <div id="cropRect" class="crop-rect" style="display:none"></div>
+      </div>
+    </main>
+
+    <!-- Right: Preview & Export -->
+    <aside id="rightPanel" class="panel">
+      <div class="section">
+        <h3>Preview</h3>
+        <div id="preview"><span class="hint">Your GIF preview will appear here.</span></div>
+        <div class="footer-bar">
+          <div class="hint">Est. size: <span id="estSize">—</span></div>
+          <div class="btn-row">
+            <button id="shareGif" class="btn secondary">Share</button>
+            <button id="downloadGif" class="btn">Download GIF</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Export Settings</h3>
+        <div class="controls" style="margin-bottom:8px">
+          <div>
+            <label for="exportFps">FPS</label>
+            <input id="exportFps" type="number" value="12" min="1" max="30">
+          </div>
+          <div>
+            <label for="quality">Quality</label>
+            <input id="quality" type="range" min="1" max="10" value="8">
+          </div>
+        </div>
+        <div class="controls" style="margin-bottom:8px">
+          <div>
+            <label for="exportW">Width</label>
+            <input id="exportW" type="number" value="512" min="16">
+          </div>
+          <div>
+            <label for="exportH">Height</label>
+            <input id="exportH" type="number" value="512" min="16">
+          </div>
+        </div>
+        <div class="btn-row">
+          <button id="renderGif" class="btn">Render GIF</button>
+          <button id="optimizeGif" class="btn secondary">Optimize</button>
+        </div>
+      </div>
+
+      <div class="section">
+        <h3>Help</h3>
+        <p class="hint">Shortcuts: <span class="kbd">Alt+N</span> new, <span class="kbd">Alt+S</span> save PNG. Drag files anywhere to import.</p>
+      </div>
+    </aside>
+
+    <!-- Timeline / Thumbnails -->
+    <section id="timeline" class="panel">
+      <div class="timeline-left panel" style="overflow:hidden">
+        <div class="timeline-panel">
+          <h3>Frames</h3>
+          <div id="thumbs" class="thumbs"></div>
+        </div>
+      </div>
+      <div class="timeline-right panel" style="overflow:hidden">
+        <div class="timeline-panel">
+          <h3>Video</h3>
+          <video id="video" controls style="width:100%; border-radius:12px; background:#0b1020"></video>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- gif.js (encoder) via CDN. Worker script URL must be provided. -->
+  <script src="https://cdn.jsdelivr.net/npm/gif.js.optimized/dist/gif.js"></script>
+
+  <script>
+    // ========================= Utility helpers =========================
+    const $ = sel => document.querySelector(sel);
+    const $$ = sel => Array.from(document.querySelectorAll(sel));
+
+    function blobToObjectURL(blob) { return URL.createObjectURL(blob); }
+
+    function downloadBlob(blob, filename) {
+      const a = document.createElement('a');
+      a.href = blobToObjectURL(blob);
+      a.download = filename;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+    }
+
+    function clamp(n, a, b) { return Math.max(a, Math.min(b, n)); }
+
+    // Estimate size: rough 1 byte/pixel per frame after palette (highly approximate)
+    function estimateGifSize(width, height, frames, fps) {
+      const pixels = width * height * frames;
+      const header = 1024 * 50; // ~50KB overhead
+      return header + pixels * 0.25; // rough guess
+    }
+
+    // ========================= Canvas + State =========================
+    const canvas = $('#canvas');
+    const ctx = canvas.getContext('2d');
+    ctx.imageSmoothingEnabled = true;
+
+    let imageBitmapCurrent = null; // current base layer image
+    let texts = []; // overlay text objects [{x,y,text,size,family,color}]
+
+    function resetAll() {
+      texts = [];
+      imageBitmapCurrent = null;
+      ctx.clearRect(0,0,canvas.width, canvas.height);
+      $('#preview').innerHTML = '<span class="hint">Your GIF preview will appear here.</span>';
+      $('#estSize').textContent = '—';
+      $('#video').removeAttribute('src');
+      $('#video').load();
+      $('#thumbs').innerHTML = '';
+      $('#rotate').value = 0;
+    }
+
+    // Fit canvas to media dimensions
+    function fitCanvasTo(bitmap) {
+      canvas.width = bitmap.width; canvas.height = bitmap.height;
+      $('#canvasW').value = bitmap.width; $('#canvasH').value = bitmap.height;
+      $('#exportW').value = bitmap.width; $('#exportH').value = bitmap.height;
+    }
+
+    function drawAll() {
+      ctx.clearRect(0,0,canvas.width, canvas.height);
+      if (imageBitmapCurrent) ctx.drawImage(imageBitmapCurrent, 0, 0, canvas.width, canvas.height);
+      // draw texts
+      for (const t of texts) {
+        ctx.save();
+        ctx.font = `${t.size}px ${t.family}`;
+        ctx.fillStyle = t.color;
+        ctx.textBaseline = 'alphabetic';
+        ctx.fillText(t.text, t.x, t.y);
+        ctx.restore();
+      }
+    }
+
+    // ========================= Drag & Drop =========================
+    const dropzone = $('#dropzone');
+    function handleFiles(files) {
+      for (const file of files) {
+        if (file.type.startsWith('image/')) {
+          loadImage(file);
+        } else if (file.type.startsWith('video/')) {
+          loadVideo(file);
+        } else if (file.name.toLowerCase().endsWith('.gif')) {
+          loadGifAsImage(file);
+        }
+      }
+    }
+
+    async function loadImage(file) {
+      const bitmap = await createImageBitmap(file).catch(() => null);
+      if (!bitmap) return;
+      imageBitmapCurrent = bitmap;
+      fitCanvasTo(bitmap);
+      drawAll();
+      addThumbFromCanvas('IMG');
+    }
+
+    function loadGifAsImage(file) {
+      // For simplicity, load as <img> then draw; optimization can be re-encoding later
+      const img = new Image();
+      img.onload = () => {
+        createImageBitmap(img).then(bm => { imageBitmapCurrent = bm; fitCanvasTo(bm); drawAll(); addThumbFromCanvas('GIF'); });
+      };
+      img.src = URL.createObjectURL(file);
+    }
+
+    function loadVideo(file) {
+      const v = $('#video');
+      v.src = URL.createObjectURL(file);
+      v.load();
+      v.onloadedmetadata = () => {
+        $('#trimStart').value = 0;
+        $('#trimEnd').value = Math.min(5, v.duration.toFixed(2));
+      };
+    }
+
+    dropzone.addEventListener('dragover', (e) => { e.preventDefault(); dropzone.classList.add('dragover'); });
+    dropzone.addEventListener('dragleave', () => dropzone.classList.remove('dragover'));
+    dropzone.addEventListener('drop', (e) => {
+      e.preventDefault(); dropzone.classList.remove('dragover');
+      const files = e.dataTransfer.files; if (files && files.length) handleFiles(files);
+    });
+
+    // Browse buttons
+    $('#browseBtn').onclick = () => $('#hiddenFile').click();
+    $('#openFiles').onclick = () => $('#hiddenFile').click();
+    $('#hiddenFile').addEventListener('change', e => handleFiles(e.target.files));
+
+    // ========================= Resize & Rotate =========================
+    $('#resizeCanvas').onclick = () => {
+      const w = Math.max(1, parseInt($('#canvasW').value || '1', 10));
+      const h = Math.max(1, parseInt($('#canvasH').value || '1', 10));
+      const tmp = document.createElement('canvas');
+      tmp.width = w; tmp.height = h;
+      const tctx = tmp.getContext('2d');
+      tctx.imageSmoothingEnabled = true;
+      if (imageBitmapCurrent) tctx.drawImage(imageBitmapCurrent, 0, 0, w, h);
+      imageBitmapCurrent = tmp.transferToImageBitmap ? tmp.transferToImageBitmap() : createImageBitmap(tmp);
+      Promise.resolve(imageBitmapCurrent).then(() => { canvas.width = w; canvas.height = h; drawAll(); });
+    };
+
+    $('#fitToImage').onclick = () => { if (imageBitmapCurrent) { fitCanvasTo(imageBitmapCurrent); drawAll(); } };
+
+    $('#applyRotate').onclick = async () => {
+      const deg = parseFloat($('#rotate').value || '0');
+      const rad = deg * Math.PI / 180;
+      const sin = Math.abs(Math.sin(rad)), cos = Math.abs(Math.cos(rad));
+      const w = canvas.width, h = canvas.height;
+      const newW = Math.round(w * cos + h * sin);
+      const newH = Math.round(w * sin + h * cos);
+      const tmp = document.createElement('canvas'); tmp.width = newW; tmp.height = newH;
+      const tctx = tmp.getContext('2d');
+      tctx.translate(newW/2, newH/2);
+      tctx.rotate(rad);
+      tctx.drawImage(canvas, -w/2, -h/2);
+      imageBitmapCurrent = tmp.transferToImageBitmap ? tmp.transferToImageBitmap() : await createImageBitmap(tmp);
+      canvas.width = newW; canvas.height = newH;
+      $('#canvasW').value = newW; $('#canvasH').value = newH; $('#exportW').value = newW; $('#exportH').value = newH;
+      drawAll();
+    };
+
+    // ========================= Crop Tool =========================
+    const cropRect = $('#cropRect');
+    let cropping = false, cropStart = null, cropEnd = null;
+
+    function updateCropRect() {
+      if (!cropStart || !cropEnd) return;
+      const x = Math.min(cropStart.x, cropEnd.x);
+      const y = Math.min(cropStart.y, cropEnd.y);
+      const w = Math.abs(cropStart.x - cropEnd.x);
+      const h = Math.abs(cropStart.y - cropEnd.y);
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = rect.width / canvas.width;
+      const scaleY = rect.height / canvas.height;
+      cropRect.style.left = (rect.left + x * scaleX) + 'px';
+      cropRect.style.top = (rect.top + y * scaleY) + 'px';
+      cropRect.style.width = (w * scaleX) + 'px';
+      cropRect.style.height = (h * scaleY) + 'px';
+    }
+
+    function canvasPos(e) {
+      const rect = canvas.getBoundingClientRect();
+      const x = (e.clientX - rect.left) * (canvas.width / rect.width);
+      const y = (e.clientY - rect.top) * (canvas.height / rect.height);
+      return { x: clamp(x,0,canvas.width), y: clamp(y,0,canvas.height) };
+    }
+
+    $('#startCrop').onclick = () => { cropping = true; cropStart = cropEnd = null; cropRect.style.display = 'block'; $('#applyCrop').disabled = true; $('#cancelCrop').disabled = false; };
+    $('#cancelCrop').onclick = () => { cropping = false; cropRect.style.display = 'none'; };
+
+    window.addEventListener('mousedown', (e) => {
+      if (!cropping) return; if (e.target !== canvas) return;
+      cropStart = canvasPos(e); cropEnd = cropStart; updateCropRect();
+      window.addEventListener('mousemove', onCropMove);
+      window.addEventListener('mouseup', onCropUp, { once: true });
+    });
+
+    function onCropMove(e){ cropEnd = canvasPos(e); updateCropRect(); }
+    function onCropUp(){ window.removeEventListener('mousemove', onCropMove); $('#applyCrop').disabled = false; }
+
+    $('#applyCrop').onclick = async () => {
+      if (!cropStart || !cropEnd) return;
+      const x = Math.floor(Math.min(cropStart.x, cropEnd.x));
+      const y = Math.floor(Math.min(cropStart.y, cropEnd.y));
+      const w = Math.max(1, Math.floor(Math.abs(cropStart.x - cropEnd.x)));
+      const h = Math.max(1, Math.floor(Math.abs(cropStart.y - cropEnd.y)));
+      const tmp = document.createElement('canvas'); tmp.width = w; tmp.height = h;
+      const tctx = tmp.getContext('2d');
+      tctx.drawImage(canvas, x, y, w, h, 0, 0, w, h);
+      imageBitmapCurrent = tmp.transferToImageBitmap ? tmp.transferToImageBitmap() : await createImageBitmap(tmp);
+      canvas.width = w; canvas.height = h; $('#canvasW').value = w; $('#canvasH').value = h; $('#exportW').value = w; $('#exportH').value = h;
+      cropRect.style.display = 'none'; cropping = false; drawAll(); addThumbFromCanvas('CROP');
+    };
+
+    // ========================= Text Overlay (draggable) =========================
+    $('#addText').onclick = () => {
+      const text = $('#textInput').value.trim(); if (!text) return;
+      const size = parseInt($('#fontSize').value,10) || 32;
+      const family = $('#fontFamily').value || 'Inter';
+      const color = $('#fontColor').value || '#fff';
+      texts.push({ x: 40, y: 60, text, size, family, color, id: crypto.randomUUID() });
+      drawAll(); addThumbFromCanvas('TXT');
+    };
+    $('#clearText').onclick = () => { texts = []; drawAll(); addThumbFromCanvas('CLR'); };
+
+    // drag text
+    let draggingText = null; let dragOffset = {x:0,y:0};
+    canvas.addEventListener('mousedown', (e) => {
+      const pos = canvasPos(e);
+      // hit test: naive using text metrics baseline approx
+      for (let i = texts.length - 1; i >= 0; i--) {
+        const t = texts[i];
+        ctx.font = `${t.size}px ${t.family}`;
+        const m = ctx.measureText(t.text);
+        const w = m.width, h = t.size;
+        if (pos.x >= t.x && pos.x <= t.x + w && pos.y <= t.y && pos.y >= t.y - h) {
+          draggingText = t; dragOffset.x = pos.x - t.x; dragOffset.y = pos.y - t.y; break;
+        }
+      }
+    });
+    window.addEventListener('mousemove', (e) => {
+      if (!draggingText) return; const pos = canvasPos(e);
+      if (e.shiftKey) { // lock axis by smallest movement
+        const dx = pos.x - draggingText.x, dy = pos.y - draggingText.y;
+        if (Math.abs(dx) > Math.abs(dy)) draggingText.y = pos.y - dragOffset.y; else draggingText.x = pos.x - dragOffset.x;
+      } else {
+        draggingText.x = pos.x - dragOffset.x; draggingText.y = pos.y - dragOffset.y;
+      }
+      drawAll();
+    });
+    window.addEventListener('mouseup', () => { if (draggingText){ draggingText=null; addThumbFromCanvas('MOVE'); }});
+
+    // ========================= Timeline / Thumbs =========================
+    function addThumbFromCanvas(label) {
+      const t = document.createElement('canvas'); t.width = 80; t.height = 64;
+      const tctx = t.getContext('2d'); tctx.fillStyle = '#0b1020'; tctx.fillRect(0,0,80,64);
+      const r = Math.min(80 / canvas.width, 64 / canvas.height);
+      const w = canvas.width * r, h = canvas.height * r;
+      tctx.drawImage(canvas, (80 - w)/2, (64 - h)/2, w, h);
+      const wrap = document.createElement('div'); wrap.className = 'thumb';
+      const img = new Image(); img.src = t.toDataURL(); wrap.appendChild(img);
+      const s = document.createElement('small'); s.textContent = label; wrap.appendChild(s);
+      $('#thumbs').appendChild(wrap);
+    }
+
+    // ========================= Render GIF (from current canvas only) =========================
+    async function renderSimpleGif() {
+      const fps = clamp(parseInt($('#exportFps').value,10)||12,1,30);
+      const quality = clamp(parseInt($('#quality').value,10)||8,1,10);
+      const outW = Math.max(16, parseInt($('#exportW').value,10)||canvas.width);
+      const outH = Math.max(16, parseInt($('#exportH').value,10)||canvas.height);
+
+      const off = document.createElement('canvas'); off.width = outW; off.height = outH;
+      const octx = off.getContext('2d');
+
+      // Create GIF encoder
+      const gif = new GIF({ workers: 2, quality: quality, workerScript: 'https://cdn.jsdelivr.net/npm/gif.js.optimized/dist/gif.worker.js' });
+
+      // For demonstration, add 1 second of animation by slightly pulsing text opacity
+      const frames = fps; // 1s
+      for (let i=0; i<frames; i++) {
+        octx.clearRect(0,0,outW,outH);
+        // draw base layer scaled
+        if (imageBitmapCurrent) octx.drawImage(imageBitmapCurrent, 0, 0, outW, outH);
+        // draw text overlays
+        for (const t of texts) {
+          octx.save();
+          octx.font = `${t.size * (outW/canvas.width)}px ${t.family}`;
+          octx.fillStyle = t.color;
+          octx.globalAlpha = 0.9 + 0.1*Math.sin((i/frames)*Math.PI*2);
+          octx.fillText(t.text, t.x * (outW/canvas.width), t.y * (outH/canvas.height));
+          octx.restore();
+        }
+        gif.addFrame(octx, { copy: true, delay: 1000/fps });
+      }
+
+      const est = estimateGifSize(outW, outH, frames, fps);
+      $('#estSize').textContent = (est/1024).toFixed(1) + ' KB';
+
+      return new Promise((resolve) => {
+        gif.on('finished', (blob) => resolve(blob));
+        gif.render();
+      });
+    }
+
+    $('#renderGif').onclick = async () => {
+      if (!imageBitmapCurrent) { alert('Please import an image or video first.'); return; }
+      const blob = await renderSimpleGif();
+      const url = blobToObjectURL(blob);
+      $('#preview').innerHTML = `<img src="${url}" style="max-width:100%;max-height:210px">`;
+      $('#downloadGif').onclick = () => downloadBlob(blob, 'output.gif');
+      $('#shareGif').onclick = async () => {
+        if (navigator.share && navigator.canShare && navigator.canShare({ files: [new File([blob],'gif.gif',{type:'image/gif'})] })) {
+          await navigator.share({ files: [new File([blob], 'gif.gif', { type: 'image/gif' })], title: 'My GIF', text: 'Made with Modern GIF Editor' }).catch(()=>{});
+        } else {
+          downloadBlob(blob, 'output.gif');
+          alert('Sharing not supported in this browser. The GIF was downloaded — please share it manually.');
+        }
+      };
+    };
+
+    // ========================= Video → GIF =========================
+    async function videoToGif() {
+      const v = $('#video'); if (!v.src) { alert('Load a video first.'); return; }
+      const start = parseFloat($('#trimStart').value)||0;
+      const end = Math.min(parseFloat($('#trimEnd').value)||v.duration, v.duration);
+      const fps = clamp(parseInt($('#fps').value,10)||12,1,30);
+      const scale = clamp(parseInt($('#scale').value,10)||100,10,200) / 100;
+
+      const width = Math.round((v.videoWidth || canvas.width || 512) * scale);
+      const height = Math.round((v.videoHeight || canvas.height || 512) * scale);
+      const off = document.createElement('canvas'); off.width = width; off.height = height;
+      const octx = off.getContext('2d');
+
+      const gif = new GIF({ workers: 2, quality: 8, workerScript: 'https://cdn.jsdelivr.net/npm/gif.js.optimized/dist/gif.worker.js' });
+
+      const totalFrames = Math.max(1, Math.floor((end - start) * fps));
+      const delay = 1000 / fps;
+
+      // Helper to seek video to a time and await the frame
+      const seekTo = (time) => new Promise(resolve => {
+        const handler = () => { v.removeEventListener('seeked', handler); resolve(); };
+        v.addEventListener('seeked', handler, { once: true }); v.currentTime = time;
+      });
+
+      v.pause();
+      for (let i=0; i<totalFrames; i++) {
+        const t = start + (i / totalFrames) * (end - start);
+        await seekTo(t);
+        octx.clearRect(0,0,width,height);
+        octx.drawImage(v, 0, 0, width, height);
+        // draw texts on top if any
+        for (const txt of texts) {
+          octx.save();
+          octx.font = `${txt.size * (width/canvas.width)}px ${txt.family}`;
+          octx.fillStyle = txt.color;
+          octx.fillText(txt.text, txt.x * (width/canvas.width), txt.y * (height/canvas.height));
+          octx.restore();
+        }
+        gif.addFrame(octx, { copy: true, delay });
+      }
+
+      return new Promise((resolve) => { gif.on('finished', (blob) => resolve(blob)); gif.render(); });
+    }
+
+    $('#videoToGif').onclick = async () => {
+      const blob = await videoToGif();
+      const url = blobToObjectURL(blob);
+      $('#preview').innerHTML = `<img src="${url}" style="max-width:100%;max-height:210px">`;
+      $('#downloadGif').onclick = () => downloadBlob(blob, 'video.gif');
+      $('#shareGif').onclick = async () => {
+        if (navigator.share && navigator.canShare && navigator.canShare({ files: [new File([blob],'gif.gif',{type:'image/gif'})] })) {
+          await navigator.share({ files: [new File([blob], 'gif.gif', { type: 'image/gif' })], title: 'My GIF', text: 'Made with Modern GIF Editor' }).catch(()=>{});
+        } else {
+          downloadBlob(blob, 'video.gif');
+          alert('Sharing not supported in this browser. The GIF was downloaded — please share it manually.');
+        }
+      };
+    };
+
+    // ========================= Optimize (simple) =========================
+    // Re-encode at chosen FPS/dimensions/quality
+    $('#optimizeGif').onclick = async () => {
+      if (!imageBitmapCurrent) { alert('Load an image/video or render a GIF first.'); return; }
+      const blob = await renderSimpleGif();
+      const url = blobToObjectURL(blob);
+      $('#preview').innerHTML = `<img src="${url}" style="max-width:100%;max-height:210px">`;
+      $('#downloadGif').onclick = () => downloadBlob(blob, 'optimized.gif');
+    };
+
+    // ========================= Export PNG =========================
+    $('#saveProject').onclick = () => {
+      canvas.toBlob((blob) => downloadBlob(blob, 'canvas.png'));
+    };
+
+    // ========================= New / Shortcuts =========================
+    $('#newProject').onclick = resetAll;
+    window.addEventListener('keydown', (e) => {
+      if (e.altKey && e.key.toLowerCase() === 'n') { e.preventDefault(); resetAll(); }
+      if (e.altKey && e.key.toLowerCase() === 's') { e.preventDefault(); $('#saveProject').click(); }
+    });
+
+    // Initialize
+    drawAll();
+  </script>
+</body>
+</html>
